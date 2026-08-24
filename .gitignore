@@ -1,0 +1,9 @@
+# binarios compilados
+battery_guardian
+BatteryGuardianMenu
+smc_probe
+*.o
+*.dSYM/
+
+# sistema
+.DS_Store
