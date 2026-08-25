@@ -52,6 +52,9 @@ install -m 0644 ./com.batteryguardian.app.plist "${APP_DST}/Contents/Info.plist"
 # LaunchAgent de usuario (arranque automático con la sesión)
 AGENT_PLIST="/Users/${REAL_USER}/Library/LaunchAgents/${MENU_LABEL}.plist"
 mkdir -p "/Users/${REAL_USER}/Library/LaunchAgents"
+# limpiar etiqueta antigua del proyecto (evita instancias duplicadas)
+launchctl bootout "gui/$(id -u "${REAL_USER}")/com.jesusc.battery-guardian-menu" 2>/dev/null || true
+rm -f "/Users/${REAL_USER}/Library/LaunchAgents/com.jesusc.battery-guardian-menu.plist"
 install -m 0644 ./com.batteryguardian.agent.plist "${AGENT_PLIST}"
 chown "${REAL_USER}:staff" "${AGENT_PLIST}"
 launchctl bootout "gui/$(id -u "${REAL_USER}")/${MENU_LABEL}" 2>/dev/null || true
