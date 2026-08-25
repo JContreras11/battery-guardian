@@ -17,9 +17,11 @@ final class AppState {
     var percent = -1
     var onAC = false
     var charging = false
-    var inhibited = false   // CH0C=1 (carga inhibida por el guardian)
+    var inhibited = false   // carga inhibida por el guardian
     var paused = false      // pausa manual desde la app
     var daemonAlive = false // state.json con ts < 90 s
+    var high = 80
+    var low = 20
 
     static func load() -> AppState {
         let st = AppState()
@@ -40,6 +42,10 @@ final class AppState {
         st.charging = boolVal("charging")
         st.inhibited = boolVal("inhibited")
         st.paused = boolVal("paused")
+        st.high = intVal("high")
+        st.low = intVal("low")
+        if st.high <= 0 { st.high = 80 }
+        if st.low <= 0 { st.low = 20 }
         if let r = raw.range(of: "\"ts\":([0-9]+)", options: .regularExpression) {
             let ts = Double(raw[r].components(separatedBy: ":")[1]) ?? 0
             st.daemonAlive = (Date().timeIntervalSince1970 - ts) < 90
@@ -49,10 +55,11 @@ final class AppState {
 
     var statusText: String {
         guard daemonAlive else { return "Daemon no responde" }
-        if paused { return "En pausa — carga normal" }
-        if inhibited { return "Inhibido — descargando hasta 40%" }
-        if charging { return "Cargando hacia 100%" }
-        return onAC ? "En carga flotante (100%)" : "Sobre batería (guardian en espera)"
+        let band = " (banda \(low)-\(high)%)"
+        if paused { return "En pausa — carga libre" }
+        if inhibited { return "Inhibido — descargando hasta \(low)%\(band)" }
+        if charging { return "Cargando hacia \(high)%" }
+        return onAC ? "En \(high)% con cargador (flotando)" : "Sobre batería — guardian en espera"
     }
 }
 

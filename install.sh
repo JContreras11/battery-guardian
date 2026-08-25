@@ -12,23 +12,28 @@ BIN_DST="/usr/local/libexec/battery-guardian"
 PLIST_DST="/Library/LaunchDaemons/${LABEL}.plist"
 STATE_DIR="/usr/local/var/battery-guardian"
 
-echo "[1/6] Compilando daemon..."
+echo "[1/7] Compilando daemon..."
 clang -O2 -Wall -Wextra -framework IOKit -framework CoreFoundation \
       -o "${BIN_SRC}" battery_guardian.c
 
-echo "[2/6] Compilando app de barra de menú..."
+echo "[2/7] Compilando app de barra de menú..."
 swiftc -O -o BatteryGuardianMenu BatteryGuardianMenu.swift
 
-echo "[3/6] Instalando daemon en ${BIN_DST}..."
+echo "[3/7] Instalando daemon en ${BIN_DST}..."
 mkdir -p /usr/local/libexec
 install -m 0755 "${BIN_SRC}" "${BIN_DST}"
 
-echo "[4/6] Preparando directorio de estado compartido..."
+echo "[4/7] Preparando directorio de estado y configuración..."
 mkdir -p "${STATE_DIR}"
 chown root:wheel "${STATE_DIR}"
 chmod 0777 "${STATE_DIR}"
+# configuración (no se sobrescribe si ya existe)
+mkdir -p /usr/local/etc
+if [[ ! -f /usr/local/etc/battery-guardian.conf ]]; then
+  install -m 0644 ./config.example /usr/local/etc/battery-guardian.conf
+fi
 
-echo "[5/6] Instalando LaunchDaemon..."
+echo "[5/7] Instalando LaunchDaemon..."
 install -m 0644 ./com.batteryguardian.plist "${PLIST_DST}"
 # limpiar etiqueta de versiones anteriores del proyecto
 launchctl bootout system/com.jesusc.battery-guardian 2>/dev/null || true
@@ -37,7 +42,7 @@ launchctl bootout system/"${LABEL}" 2>/dev/null || true
 launchctl bootstrap system "${PLIST_DST}" 2>/dev/null || \
   launchctl kickstart -k system/"${LABEL}"
 
-echo "[6/6] Instalando app de barra de menú para ${REAL_USER}..."
+echo "[6/7] Instalando app de barra de menú para ${REAL_USER}..."
 APP_DST="/Applications/Battery Guardian.app"
 rm -rf "${APP_DST}"
 mkdir -p "${APP_DST}/Contents/MacOS"

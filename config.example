@@ -1,0 +1,13 @@
+# Configuración de battery-guardian (leída cada ciclo)
+# Banda de carga recomendada según evidencia (Battery University BU-808,
+# práctica EV/industrial): techo 80% ≈ 4.06-4.1V/celda (600-1500 ciclos vs
+# 300-500 al 100%); piso 20% (banda 75-25% ≈ 3000 ciclos en estudios DST).
+# Valores válidos: 5 <= LOW_RESUME < HIGH_STOP <= 100
+HIGH_STOP=80
+LOW_RESUME=20
+# Durante el sueño del sistema el daemon se congela; el SMC mantiene el último
+# estado. Para seguir controlando, el daemon programa despertares silenciosos
+# con este intervalo (solo si hay cargador conectado).
+WAKE_INTERVAL_MIN=60
+# Sondeo mientras el sistema está despierto
+POLL_SECONDS=30

@@ -3,9 +3,15 @@
  *
  * Mantiene la bateria dentro de la banda [LOW_RESUME .. HIGH_STOP] mientras el
  * cargador este conectado:
- *   - Al llegar a HIGH_STOP (100%) inhibe la carga y desconecta la alimentacion
- *     externa para que el pack se descargue.
- *   - Al bajar a LOW_RESUME (40%) reactiva la carga.
+ *   - Al llegar a HIGH_STOP (80 por defecto) inhibe la carga y desconecta la
+ *     alimentacion externa para que el pack se descargue.
+ *   - Al bajar a LOW_RESUME (20 por defecto) reactiva la carga.
+ *
+ * Sueño del sistema: al dormir, el proceso se congela pero el SMC mantiene el
+ * ultimo estado escrito. Antes de dormir se garantiza carga INHIBIDA si la
+ * bateria esta por encima del piso (evita recargas al techo durante la noche)
+ * y se programa un despertar silencioso (kIOPMAutoWake) cada WAKE_INTERVAL_MIN
+ * para reevaluar la banda y evitar descargas profundas.
  *
  * Protocolo SMC: user client moderno de AppleSMC (IOServiceOpen tipo 1 +
  * kSMCUserClientOpen + selector kSMCHandleYPCEvent), constantes derivadas de
@@ -13,7 +19,7 @@
  * Marvin Haeuser (BSD-3-Clause). Llaves: CHTE (ui32) o CH0C para carga;
  * CHIE o CH0J para el adaptador, segun firmware.
  *
- * Este archivo se distribuye bajo GPL v2 (compatible con las referencias).
+ * Este archivo se distribuye bajo GPL v2.
  *
  * Uso:
  *   battery-guardian run      bucle principal (lo invoca launchd como root)
@@ -32,13 +38,17 @@
 #include <syslog.h>
 #include <time.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <IOKit/ps/IOPowerSources.h>
 #include <IOKit/ps/IOPSKeys.h>
 
-#define HIGH_STOP     100
-#define LOW_RESUME    40
-#define POLL_SECONDS  30
-#define HEARTBEAT_EVERY 120 /* ticks (~1 h) */
+/* valores por defecto; sobrescribibles por /usr/local/etc/battery-guardian.conf */
+#define DEFAULT_HIGH_STOP  80
+#define DEFAULT_LOW_RESUME 20
+#define DEFAULT_WAKE_MIN   60
+#define DEFAULT_POLL_SECS  30
+#define HEARTBEAT_EVERY    120 /* ticks (~1 h) */
 
 #define kSMCUserClientOpen  0
 #define kSMCUserClientClose 1
@@ -52,6 +62,9 @@
 #define STATE_DIR    "/usr/local/var/battery-guardian"
 #define STATE_FILE   STATE_DIR "/state.json"
 #define PAUSE_FILE   STATE_DIR "/paused"
+#define CONF_FILE    "/usr/local/etc/battery-guardian.conf"
+
+#define WAKE_ID CFSTR("com.batteryguardian")
 
 typedef char UInt32Char_t[5];
 
@@ -101,6 +114,11 @@ typedef struct {
 static io_connect_t g_conn = 0;
 static volatile sig_atomic_t g_stop = 0;
 
+static int g_high = DEFAULT_HIGH_STOP;
+static int g_low = DEFAULT_LOW_RESUME;
+static int g_wake_min = DEFAULT_WAKE_MIN;
+static int g_poll_secs = DEFAULT_POLL_SECS;
+
 /* llaves detectadas al arrancar */
 static char g_charge_key[5] = {0};
 static uint32_t g_charge_size = 0;
@@ -108,6 +126,13 @@ static unsigned char g_charge_off_bytes[4] = {0x01, 0, 0, 0};
 
 static char g_adapter_key[5] = {0};
 static unsigned char g_adapter_off = 0x08;     /* CHIE: 08; CH0J: 0x20 */
+
+/* power management */
+static io_connect_t g_pm_root = 0;
+static IONotificationPortRef g_pm_notify = 0;
+static io_object_t g_pm_notifier = 0;
+static CFDateRef g_scheduled_wake = NULL;
+static time_t g_next_wake_epoch = 0;
 
 static uint32_t key_to_uint(const char *s)
 {
@@ -141,7 +166,6 @@ static kern_return_t smc_open(void)
     IOObjectRelease(dev);
     if (r != KERN_SUCCESS) return r;
 
-    /* apertura explicita del user client */
     r = IOConnectCallMethod(g_conn, kSMCUserClientOpen,
                             NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
     if (r != KERN_SUCCESS) {
@@ -197,7 +221,6 @@ static kern_return_t smc_read_key(const char *key4, SMCVal_t *val)
     return KERN_SUCCESS;
 }
 
-/* escribe y verifica releyendo (como Battery-Toolkit) */
 static bool smc_write_key(const char *key4, const unsigned char *bytes, uint32_t size)
 {
     SMCKeyData_t in, out;
@@ -215,16 +238,14 @@ static bool smc_write_key(const char *key4, const unsigned char *bytes, uint32_t
     }
 
     SMCVal_t val;
-    if (smc_read_key(key4, &val) != KERN_SUCCESS) return true; /* sin verificacion */
+    if (smc_read_key(key4, &val) != KERN_SUCCESS) return true;
     return memcmp(val.bytes, bytes, size) == 0;
 }
 
-/* detecta las llaves soportadas por este firmware */
 static bool detect_keys(void)
 {
     KeyInfo_t info;
 
-    /* carga: CHTE (ui32, 4 bytes) o CH0C (1 byte) */
     if (smc_get_keyinfo("CHTE", &info) == KERN_SUCCESS &&
         info.dataSize == 4) {
         snprintf(g_charge_key, sizeof g_charge_key, "CHTE");
@@ -240,7 +261,6 @@ static bool detect_keys(void)
         return false;
     }
 
-    /* adaptador: CHIE (0x08) o CH0J (0x20), 1 byte */
     if (smc_get_keyinfo("CHIE", &info) == KERN_SUCCESS && info.dataSize == 1) {
         snprintf(g_adapter_key, sizeof g_adapter_key, "CHIE");
         g_adapter_off = 0x08;
@@ -249,7 +269,7 @@ static bool detect_keys(void)
         snprintf(g_adapter_key, sizeof g_adapter_key, "CH0J");
         g_adapter_off = 0x20;
     } else {
-        g_adapter_key[0] = '\0'; /* sin control de adaptador: solo inhibir carga */
+        g_adapter_key[0] = '\0';
     }
     return true;
 }
@@ -316,6 +336,141 @@ static int read_battery(int *pct, bool *onAC, bool *charging)
     return found;
 }
 
+/* ---------- configuracion ---------- */
+
+static void load_config(void)
+{
+    FILE *f = fopen(CONF_FILE, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        int v;
+        if (sscanf(line, "HIGH_STOP=%d", &v) == 1 && v >= 10 && v <= 100)
+            g_high = v;
+        else if (sscanf(line, "LOW_RESUME=%d", &v) == 1 && v >= 5 && v <= 90)
+            g_low = v;
+        else if (sscanf(line, "WAKE_INTERVAL_MIN=%d", &v) == 1 && v >= 15 && v <= 360)
+            g_wake_min = v;
+        else if (sscanf(line, "POLL_SECONDS=%d", &v) == 1 && v >= 10 && v <= 300)
+            g_poll_secs = v;
+    }
+    fclose(f);
+    if (g_low >= g_high - 5) g_low = g_high - 5;
+}
+
+/* ---------- despertares programados ---------- */
+
+static void cancel_scheduled_wake(void)
+{
+    if (g_scheduled_wake) {
+        IOPMCancelScheduledPowerEvent(g_scheduled_wake, WAKE_ID,
+                                      CFSTR("wake"));
+        CFRelease(g_scheduled_wake);
+        g_scheduled_wake = NULL;
+    }
+    g_next_wake_epoch = 0;
+}
+
+static void schedule_next_wake(bool onAC)
+{
+    if (!onAC || g_wake_min <= 0) {
+        cancel_scheduled_wake();
+        return;
+    }
+
+    cancel_scheduled_wake();
+
+    CFAbsoluteTime wakeTime = CFAbsoluteTimeGetCurrent() +
+                              (CFAbsoluteTime)(g_wake_min * 60);
+    g_scheduled_wake = CFDateCreate(NULL, wakeTime);
+    IOReturn r = IOPMSchedulePowerEvent(g_scheduled_wake, WAKE_ID,
+                                        CFSTR("wake"));
+    if (r == kIOReturnSuccess) {
+        g_next_wake_epoch = (time_t)wakeTime;
+        syslog(LOG_NOTICE, "despertar programado en %d min", g_wake_min);
+    } else {
+        CFRelease(g_scheduled_wake);
+        g_scheduled_wake = NULL;
+        syslog(LOG_ERR, "IOPMSchedulePowerEvent fallo: %08x", r);
+    }
+}
+
+/* ---------- notificaciones de sueño/despertar ---------- */
+
+static void pm_callback(void *refcon, io_service_t service,
+                        natural_t messageType, void *messageArgument)
+{
+    (void)refcon; (void)service;
+
+    switch (messageType) {
+    case kIOMessageCanSystemSleep:
+        IOAllowPowerChange(g_pm_root, (intptr_t)messageArgument);
+        break;
+
+    case kIOMessageSystemWillSleep: {
+        int pct = -1; bool onAC = false, charging = false;
+        read_battery(&pct, &onAC, &charging);
+        bool readOk = false;
+        bool inh = charge_inhibited(&readOk);
+        bool paused = (access(PAUSE_FILE, F_OK) == 0);
+
+        if (onAC && !paused && readOk && !inh && pct > g_low) {
+            /* durante el sueño no debe seguir cargando hacia el techo */
+            set_charge_enabled(false);
+            syslog(LOG_NOTICE, "sueño: carga inhibida (bateria %d%%, banda %d-%d)",
+                   pct, g_low, g_high);
+        }
+        if (onAC && !paused) schedule_next_wake(true);
+        else cancel_scheduled_wake();
+
+        IOAllowPowerChange(g_pm_root, (intptr_t)messageArgument);
+        break;
+    }
+
+    case kIOMessageSystemHasPoweredOn:
+        syslog(LOG_NOTICE, "sistema desperto: reevaluando banda");
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void pm_start(void)
+{
+    g_pm_notify = IONotificationPortCreate(kIOMainPortDefault);
+    if (!g_pm_notify) return;
+    CFRunLoopSourceRef src = IONotificationPortGetRunLoopSource(g_pm_notify);
+    if (src) {
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
+    }
+    g_pm_root = IORegisterForSystemPower(NULL, &g_pm_notify, pm_callback,
+                                         &g_pm_notifier);
+    if (g_pm_root == 0) {
+        syslog(LOG_ERR, "IORegisterForSystemPower fallo");
+        g_pm_notify = NULL;
+    }
+}
+
+static void pm_stop(void)
+{
+    if (g_pm_notifier) {
+        IOObjectRelease(g_pm_notifier);
+        g_pm_notifier = 0;
+    }
+    if (g_pm_notify) {
+        IONotificationPortDestroy(g_pm_notify);
+        g_pm_notify = NULL;
+    }
+    if (g_pm_root) {
+        IOServiceClose(g_pm_root);
+        g_pm_root = 0;
+    }
+}
+
+/* ---------- ciclo principal ---------- */
+
 static void on_signal(int sig)
 {
     (void)sig;
@@ -328,10 +483,27 @@ static void install_signals(void)
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; /* sin SA_RESTART: interrumpe sleep() */
+    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+}
+
+static void publish_state(int pct, bool onAC, bool charging, bool inh,
+                          bool readOk, bool paused)
+{
+    FILE *f = fopen(STATE_FILE ".tmp", "w");
+    if (f) {
+        fprintf(f,
+            "{\"ts\":%ld,\"percent\":%d,\"ac\":%s,\"charging\":%s,"
+            "\"inhibited\":%s,\"paused\":%s,\"high\":%d,\"low\":%d}\n",
+            (long)time(NULL), pct, onAC ? "true" : "false",
+            charging ? "true" : "false",
+            (readOk && inh) ? "true" : "false",
+            paused ? "true" : "false", g_high, g_low);
+        fclose(f);
+        rename(STATE_FILE ".tmp", STATE_FILE);
+    }
 }
 
 /* Una pasada: lee bateria + llaves SMC y escribe solo si hay que cambiar. */
@@ -351,10 +523,10 @@ static int tick_once(bool allow_writes)
 
     int desired = -1; /* -1 = mantener */
     if (paused) {
-        desired = 0; /* en pausa: asegurar carga normal */
-    } else if (pct >= HIGH_STOP) {
+        desired = 0;
+    } else if (pct >= g_high) {
         desired = 1;
-    } else if (pct <= LOW_RESUME) {
+    } else if (pct <= g_low) {
         desired = 0;
     } else if (readOk && inh) {
         desired = 1; /* banda media ya inhibida */
@@ -362,44 +534,29 @@ static int tick_once(bool allow_writes)
 
     if (geteuid() != 0) allow_writes = false;
 
-    bool writeApplied = false;
     if (allow_writes && desired >= 0 && readOk && (inh != (desired == 1))) {
         bool ok = set_charge_enabled(desired == 0);
-        writeApplied = ok;
         if (!ok) {
             syslog(LOG_ERR, "fallo al %s carga",
                    desired ? "inhibir" : "restaurar");
         } else {
-            syslog(LOG_NOTICE, "bateria %d%% AC=%d cargando=%d -> %s%s",
+            syslog(LOG_NOTICE,
+                   "bateria %d%% AC=%d cargando=%d -> %s (banda %d-%d)%s",
                    pct, onAC, charging,
-                   desired ? "INHIBIR (descargar hasta 40%)"
-                           : "CARGAR hasta 100%",
+                   desired ? "INHIBIR" : "CARGAR",
+                   g_low, g_high,
                    paused ? " [EN PAUSA]" : "");
         }
         inh = desired == 1;
     }
 
-    /* publicar estado para la app de barra de menu */
-    FILE *f = fopen(STATE_FILE ".tmp", "w");
-    if (f) {
-        fprintf(f,
-            "{\"ts\":%ld,\"percent\":%d,\"ac\":%s,\"charging\":%s,"
-            "\"inhibited\":%s,\"paused\":%s}\n",
-            (long)time(NULL), pct, onAC ? "true" : "false",
-            charging ? "true" : "false",
-            (readOk && inh) ? "true" : "false",
-            paused ? "true" : "false");
-        fclose(f);
-        rename(STATE_FILE ".tmp", STATE_FILE);
-    }
-
+    publish_state(pct, onAC, charging, inh, readOk, paused);
     printf("{\"ts\":%ld,\"percent\":%d,\"ac\":%s,\"charging\":%s,"
-           "\"inhibited\":%s,\"paused\":%s,\"applied\":%s}\n",
+           "\"inhibited\":%s,\"paused\":%s,\"high\":%d,\"low\":%d}\n",
            (long)time(NULL), pct, onAC ? "true" : "false",
            charging ? "true" : "false",
            (readOk && inh) ? "true" : "false",
-           paused ? "true" : "false",
-           writeApplied ? "true" : "false");
+           paused ? "true" : "false", g_high, g_low);
     fflush(stdout);
     return 0;
 }
@@ -407,6 +564,8 @@ static int tick_once(bool allow_writes)
 int main(int argc, char **argv)
 {
     const char *mode = (argc > 1) ? argv[1] : "run";
+
+    load_config();
 
     if (strcmp(mode, "status") == 0) {
         int pct = -1; bool onAC = false, charging = false;
@@ -422,9 +581,10 @@ int main(int argc, char **argv)
         bool ok = false;
         bool inh = charge_inhibited(&ok);
         bool paused = (access(PAUSE_FILE, F_OK) == 0);
-        printf("bateria=%d%% ac=%s cargando=%s clave=%s inhibida=%d pausa=%s\n",
+        printf("bateria=%d%% ac=%s cargando=%s clave=%s inhibida=%d pausa=%s banda=%d-%d\n",
                pct, onAC ? "si" : "no", charging ? "si" : "no",
-               g_charge_key, ok ? (int)inh : -1, paused ? "si" : "no");
+               g_charge_key, ok ? (int)inh : -1, paused ? "si" : "no",
+               g_low, g_high);
         smc_close();
         return 0;
     }
@@ -435,6 +595,7 @@ int main(int argc, char **argv)
             return 1;
         }
         bool ok = set_charge_enabled(true);
+        cancel_scheduled_wake();
         printf("restaurar carga: %s\n", ok ? "ok" : "FALLO");
         smc_close();
         return ok ? 0 : 1;
@@ -454,8 +615,10 @@ int main(int argc, char **argv)
     openlog("battery-guardian", LOG_PID | LOG_NDELAY, LOG_DAEMON);
     syslog(LOG_NOTICE, "llaves: carga=%s adaptador=%s",
            g_charge_key, g_adapter_key[0] ? g_adapter_key : "(ninguno)");
-    syslog(LOG_NOTICE, "inicio: banda %d%%-%d%%, sondeo cada %ds, uid=%d",
-           LOW_RESUME, HIGH_STOP, POLL_SECONDS, geteuid());
+    syslog(LOG_NOTICE, "inicio: banda %d%%-%d%%, sondeo %ds, despertar %dmin, uid=%d",
+           g_low, g_high, g_poll_secs, g_wake_min, geteuid());
+
+    pm_start();
 
     if (strcmp(mode, "once") == 0) {
         int rc = tick_once(true);
@@ -471,12 +634,25 @@ int main(int argc, char **argv)
             since_beat = 0;
             syslog(LOG_INFO, "latido ok");
         }
-        for (int i = 0; i < POLL_SECONDS && !g_stop; i++)
-            sleep(1);
+
+        /* atender notificaciones de sueño mientras espera el siguiente tick */
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, (CFTimeInterval)g_poll_secs, true);
+
+        /* si acaba de ocurrir el despertar silencioso, reevaluar */
+        if (g_next_wake_epoch && time(NULL) >= g_next_wake_epoch - 5) {
+            syslog(LOG_NOTICE, "despertar silencioso: reevaluando banda");
+            tick_once(true);
+        }
+        int p = -1; bool ac = false, ch = false;
+        read_battery(&p, &ac, &ch);
+        bool paused = (access(PAUSE_FILE, F_OK) == 0);
+        schedule_next_wake(ac && !paused);
     }
 
     syslog(LOG_NOTICE, "parando: restaurando carga normal");
     set_charge_enabled(true);
+    cancel_scheduled_wake();
+    pm_stop();
     smc_close();
     closelog();
     return 0;
